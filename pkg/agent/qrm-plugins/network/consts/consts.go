@@ -28,6 +28,9 @@ const (
 
 	NetworkPluginDynamicPolicyName = "qrm_network_plugin_" + NetworkResourcePluginPolicyNameDynamic
 	ClearResidualState             = NetworkPluginDynamicPolicyName + "_clear_residual_state"
+	// ReconcileEDTGroups is the periodical-handler / healthz name of the BMQ-aware dynamic EDT
+	// group reconcile loop.
+	ReconcileEDTGroups = NetworkPluginDynamicPolicyName + "_reconcile_edt_groups"
 
 	StateCheckPeriod          = 30 * time.Second
 	StateCheckTolerationTimes = 3

@@ -16,6 +16,8 @@ limitations under the License.
 
 package qrm
 
+import "time"
+
 // NetworkQRMPluginConfig is the config of network QRM plugin
 type NetworkQRMPluginConfig struct {
 	// PolicyName is used to switch between several strategies
@@ -44,6 +46,27 @@ type NetworkQRMPluginConfig struct {
 	EnableNICAllocationReactor bool
 	// NICHealthCheckers is the list of enabled NIC health checkers
 	NICHealthCheckers []string
+
+	// EnableDynamicEDTReconcile gates the BMQ-aware dynamic EDT group reconcile loop.
+	// When false (the default), the network static policy keeps its single low-priority (BE) group
+	// behaviour byte-for-byte; no periodic reconcile is registered and no Online group is emitted.
+	EnableDynamicEDTReconcile bool
+	// BEGroupFloor is the minimum egress rate (Mbps) the Best-Effort group is guaranteed; BE is
+	// squeezed to this floor first under BMQ pressure (never 0).
+	BEGroupFloor uint32
+	// OnlineGroupFloor is the minimum egress rate (Mbps) the Online group is guaranteed; Online
+	// drops toward this floor only after BE is already at its floor (never 0).
+	OnlineGroupFloor uint32
+	// OnlineGroupCeil is the Online group's standing target/ceiling (Mbps) — its "normal" rate when
+	// there is no BMQ pressure. Online is never allocated above this.
+	OnlineGroupCeil uint32
+	// ReconcileInterval is the period of the dynamic EDT reconcile loop.
+	ReconcileInterval time.Duration
+	// BMQReservedPerPod is the per-BMQ-pod contracted egress reservation (Mbps); BMQ is protected by
+	// max(live runtime, numBMQ * BMQReservedPerPod).
+	BMQReservedPerPod uint32
+	// BMQSelector is the owner-pool / cpuset-enhancement value identifying BMQ pods (e.g. "bmq").
+	BMQSelector string
 }
 
 type NetClassConfig struct {

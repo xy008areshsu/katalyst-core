@@ -17,6 +17,8 @@ limitations under the License.
 package qrm
 
 import (
+	"time"
+
 	cliflag "k8s.io/component-base/cli/flag"
 
 	"github.com/kubewharf/katalyst-api/pkg/consts"
@@ -40,6 +42,15 @@ type NetworkOptions struct {
 	NetBandwidthResourceAllocationAnnotationKey     string
 	NICHealthCheckers                               []string
 	EnableNICAllocationReactor                      bool
+
+	// Dynamic BMQ-aware EDT group reconcile (default OFF — feature gate).
+	EnableDynamicEDTReconcile bool
+	BEGroupFloor              uint32
+	OnlineGroupFloor          uint32
+	OnlineGroupCeil           uint32
+	ReconcileInterval         time.Duration
+	BMQReservedPerPod         uint32
+	BMQSelector               string
 }
 
 type NetClassOptions struct {
@@ -70,6 +81,13 @@ func NewNetworkOptions() *NetworkOptions {
 		NetBandwidthResourceAllocationAnnotationKey:     "qrm.katalyst.kubewharf.io/net_bandwidth",
 		EnableNICAllocationReactor:                      true,
 		NICHealthCheckers:                               []string{"*"},
+		EnableDynamicEDTReconcile:                       false,
+		BEGroupFloor:                                    5000,
+		OnlineGroupFloor:                                5000,
+		OnlineGroupCeil:                                 40000,
+		ReconcileInterval:                               10 * time.Second,
+		BMQReservedPerPod:                               15000,
+		BMQSelector:                                     "bmq",
 	}
 }
 
@@ -115,6 +133,20 @@ func (o *NetworkOptions) AddFlags(fss *cliflag.NamedFlagSets) {
 	fs.StringSliceVar(&o.NICHealthCheckers, "network-resource-plugin-nic-health-checkers",
 		o.NICHealthCheckers, "list of nic health checkers, '*' run all on-by-default checkers,"+
 			"'ip' run checker 'ip', '-ip' not run checker 'ip'")
+	fs.BoolVar(&o.EnableDynamicEDTReconcile, "network-resource-plugin-enable-dynamic-edt-reconcile",
+		o.EnableDynamicEDTReconcile, "enable the BMQ-aware dynamic EDT group reconcile loop (default false)")
+	fs.Uint32Var(&o.BEGroupFloor, "network-resource-plugin-be-group-floor",
+		o.BEGroupFloor, "minimum egress rate (Mbps) guaranteed to the Best-Effort EDT group")
+	fs.Uint32Var(&o.OnlineGroupFloor, "network-resource-plugin-online-group-floor",
+		o.OnlineGroupFloor, "minimum egress rate (Mbps) guaranteed to the Online EDT group")
+	fs.Uint32Var(&o.OnlineGroupCeil, "network-resource-plugin-online-group-ceil",
+		o.OnlineGroupCeil, "standing target/ceiling egress rate (Mbps) for the Online EDT group")
+	fs.DurationVar(&o.ReconcileInterval, "network-resource-plugin-reconcile-interval",
+		o.ReconcileInterval, "period of the dynamic EDT reconcile loop")
+	fs.Uint32Var(&o.BMQReservedPerPod, "network-resource-plugin-bmq-reserved-per-pod",
+		o.BMQReservedPerPod, "per-BMQ-pod contracted egress reservation (Mbps)")
+	fs.StringVar(&o.BMQSelector, "network-resource-plugin-bmq-selector",
+		o.BMQSelector, "owner-pool / cpuset-enhancement value identifying BMQ pods (e.g. \"bmq\")")
 }
 
 func (o *NetworkOptions) ApplyTo(conf *qrmconfig.NetworkQRMPluginConfig) error {
@@ -137,6 +169,13 @@ func (o *NetworkOptions) ApplyTo(conf *qrmconfig.NetworkQRMPluginConfig) error {
 	conf.NetBandwidthResourceAllocationAnnotationKey = o.NetBandwidthResourceAllocationAnnotationKey
 	conf.EnableNICAllocationReactor = o.EnableNICAllocationReactor
 	conf.NICHealthCheckers = o.NICHealthCheckers
+	conf.EnableDynamicEDTReconcile = o.EnableDynamicEDTReconcile
+	conf.BEGroupFloor = o.BEGroupFloor
+	conf.OnlineGroupFloor = o.OnlineGroupFloor
+	conf.OnlineGroupCeil = o.OnlineGroupCeil
+	conf.ReconcileInterval = o.ReconcileInterval
+	conf.BMQReservedPerPod = o.BMQReservedPerPod
+	conf.BMQSelector = o.BMQSelector
 
 	return nil
 }

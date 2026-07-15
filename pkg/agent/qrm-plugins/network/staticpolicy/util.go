@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"reflect"
+	"sort"
 	"time"
 
 	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
@@ -32,6 +34,7 @@ import (
 	qrmutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
+	qrmgeneral "github.com/kubewharf/katalyst-core/pkg/util/qrm"
 )
 
 type (
@@ -48,7 +51,93 @@ const (
 	LastOne   NICSelectionPoligy = "last"
 
 	LowPriorityGroupNameSuffix = "low_priority"
+	// OnlineGroupNameSuffix is the group-name suffix of the Online (shared_cores non-BMQ) EDT group
+	// managed only when the dynamic EDT reconcile feature gate is on.
+	OnlineGroupNameSuffix = "online"
 )
+
+// Tier buckets a container for EDT-group purposes.
+type Tier int
+
+const (
+	// TierOnline is the default tier: shared_cores / dedicated / guaranteed non-BMQ workloads.
+	TierOnline Tier = iota
+	// TierBE is the Best-Effort tier: reclaimed_cores (offline / lowest priority).
+	TierBE
+	// TierBMQ is the protected BMQ tenant: never grouped, never throttled.
+	TierBMQ
+)
+
+// tierOf buckets an allocation by tier. reclaimed_cores → BE; the BMQ selector (matched against
+// the owner/specified pool name) → BMQ; everything else → Online.
+//
+// TODO(bmq): confirm bmqSelector ("bmq") against a real spot-dev E5T BMQ pod spec — the QoS level
+// plus the actual owner_pool / cpuset_pool annotation/label it carries — before relying on this in
+// production. A mis-set selector silently mis-buckets BMQ pods into the throttled Online group.
+func tierOf(ai *state.AllocationInfo, bmqSelector string) Tier {
+	if ai == nil {
+		return TierOnline
+	}
+
+	// BMQ takes precedence: a BMQ pod must never be treated as BE even if mislabeled reclaimed.
+	if bmqSelector != "" {
+		if ai.GetPoolName() == bmqSelector || ai.GetSpecifiedPoolName() == bmqSelector {
+			return TierBMQ
+		}
+	}
+
+	if ai.QoSLevel == apiconsts.PodAnnotationQoSLevelReclaimedCores {
+		return TierBE
+	}
+
+	return TierOnline
+}
+
+// clampLow returns v unless it is below floor, in which case it returns floor.
+func clampLow(v, floor uint32) uint32 {
+	if v < floor {
+		return floor
+	}
+	return v
+}
+
+// subClampZero returns a-b, clamped at 0 (no uint32 underflow).
+func subClampZero(a, b uint32) uint32 {
+	if a <= b {
+		return 0
+	}
+	return a - b
+}
+
+// groupsEqual reports whether two NetworkGroup maps are semantically equal for idempotency
+// purposes, comparing (sorted) NetClassIDs, Egress, and the merged IPs of every group. It is order
+// independent in NetClassIDs so a reshuffle of membership without a real change is a no-op.
+func groupsEqual(a, b map[string]*qrmgeneral.NetworkGroup) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for name, ga := range a {
+		gb, ok := b[name]
+		if !ok || ga == nil || gb == nil {
+			if ga == nil && gb == nil && ok {
+				continue
+			}
+			return false
+		}
+		if ga.Egress != gb.Egress || ga.Ingress != gb.Ingress ||
+			ga.MergedIPv4 != gb.MergedIPv4 || ga.MergedIPv6 != gb.MergedIPv6 {
+			return false
+		}
+		idsA := append([]string(nil), ga.NetClassIDs...)
+		idsB := append([]string(nil), gb.NetClassIDs...)
+		sort.Strings(idsA)
+		sort.Strings(idsB)
+		if !reflect.DeepEqual(idsA, idsB) {
+			return false
+		}
+	}
+	return true
+}
 
 type NICFilter func(nics []machine.InterfaceInfo, req *pluginapi.ResourceRequest, agentCtx *agent.GenericContext) []machine.InterfaceInfo
 
