@@ -48,6 +48,7 @@ import (
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	"github.com/kubewharf/katalyst-core/pkg/config/agent/qrm"
 	"github.com/kubewharf/katalyst-core/pkg/config/generic"
+	metricconsts "github.com/kubewharf/katalyst-core/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
@@ -109,6 +110,11 @@ type StaticPolicy struct {
 	podLabelKeptKeys      []string
 
 	lowPriorityGroups map[string]*qrmgeneral.NetworkGroup
+
+	// networkGroups holds the last-applied set of EDT groups produced by the dynamic reconcile loop
+	// (feature-gated). It is used for idempotency: the data plane is only rewritten when this set
+	// actually changes.
+	networkGroups map[string]*qrmgeneral.NetworkGroup
 
 	nicAllocationReactor reactor.AllocationReactor
 
@@ -262,6 +268,20 @@ func (p *StaticPolicy) Start() (err error) {
 		general.Errorf("start %v failed, err: %v", consts.ClearResidualState, err)
 	}
 
+	// Register the BMQ-aware dynamic EDT group reconcile loop ONLY when the feature gate is on.
+	// When off, no handler is registered so the data-plane path is byte-for-byte today's behaviour.
+	if p.qrmConfig != nil && p.qrmConfig.EnableDynamicEDTReconcile {
+		reconcileInterval := p.qrmConfig.ReconcileInterval
+		if reconcileInterval <= 0 {
+			reconcileInterval = consts.StateCheckPeriod
+		}
+		err = periodicalhandler.RegisterPeriodicalHandlerWithHealthz(consts.ReconcileEDTGroups, general.HealthzCheckStateNotReady,
+			appqrm.QRMNetworkPluginPeriodicalHandlerGroupName, p.reconcileEDTGroupsHandler, reconcileInterval, consts.StateCheckTolerationTimes)
+		if err != nil {
+			general.Errorf("start %v failed, err: %v", consts.ReconcileEDTGroups, err)
+		}
+	}
+
 	go wait.Until(func() {
 		periodicalhandler.ReadyToStartHandlersByGroup(appqrm.QRMNetworkPluginPeriodicalHandlerGroupName)
 	}, 5*time.Second, p.stopCh)
@@ -384,6 +404,9 @@ func (p *StaticPolicy) Stop() error {
 		general.Warningf("already stopped")
 		return nil
 	}
+	// Stop the registered periodical handlers (clearResidualState and, when enabled, the EDT
+	// reconcile loop) so a dead policy quits writing the data plane. Mirrors cpu/memory/io policies.
+	periodicalhandler.StopHandlersByGroup(appqrm.QRMNetworkPluginPeriodicalHandlerGroupName)
 	close(p.stopCh)
 	return nil
 }
@@ -1356,6 +1379,14 @@ func (p *StaticPolicy) generateLowPriorityGroup() error {
 }
 
 func (p *StaticPolicy) generateAndApplyGroups() error {
+	// Feature gate: when the dynamic EDT reconcile is enabled, the event-driven path
+	// (alloc/remove/clearResidual) defers group computation to the periodic reconcile loop, which
+	// owns the two-tier (BE+Online) groups and their idempotent apply. Doing nothing here on the
+	// event path avoids clobbering the reconciled groups with a single low-priority group.
+	if p.qrmConfig != nil && p.qrmConfig.EnableDynamicEDTReconcile {
+		return p.reconcileGroups()
+	}
+
 	err := p.generateLowPriorityGroup()
 
 	if err != nil {
@@ -1367,6 +1398,177 @@ func (p *StaticPolicy) generateAndApplyGroups() error {
 		}
 	}
 
+	return nil
+}
+
+// reconcileEDTGroupsHandler is the periodical-handler wrapper for reconcileGroups; it refreshes the
+// healthz heartbeat every run so the handler does not flip NotReady (which would restart-loop the
+// agent). Signature mirrors clearResidualState.
+func (p *StaticPolicy) reconcileEDTGroupsHandler(_ *config.Configuration,
+	_ interface{},
+	_ *dynamicconfig.DynamicAgentConfiguration,
+	_ metrics.MetricEmitter,
+	_ *metaserver.MetaServer,
+) {
+	var err error
+	defer func() {
+		_ = general.UpdateHealthzStateByError(consts.ReconcileEDTGroups, err)
+	}()
+
+	p.Lock()
+	defer p.Unlock()
+	err = p.reconcileGroups()
+	if err != nil {
+		general.Errorf("reconcileGroups failed with error: %v", err)
+	}
+}
+
+// sumBMQRuntimeEgress sums the live per-container egress BPS (already computed by Malachite as
+// consts.MetricNetTcpSendBPSContainer) over the given BMQ containers and converts to Mbps.
+func (p *StaticPolicy) sumBMQRuntimeEgress(bmqContainers []podContainer) uint32 {
+	if p.metaServer == nil {
+		return 0
+	}
+	var total float64
+	for _, pc := range bmqContainers {
+		md, err := p.metaServer.GetContainerMetric(pc.podUID, pc.containerName, metricconsts.MetricNetTcpSendBPSContainer)
+		if err != nil {
+			// tolerate missing samples (a freshly-started or unscraped container)
+			continue
+		}
+		total += md.Value // bytes/sec
+	}
+	return uint32(total * 8 / 1e6) // → Mbps (NetworkGroup.Egress unit)
+}
+
+// podContainer is a (podUID, containerName) pair used to look up per-container runtime metrics.
+type podContainer struct {
+	podUID        string
+	containerName string
+}
+
+// generateGroups computes the BE + Online EDT groups per NIC using the corrected residual/ceiling
+// formula. It is a STATELESS recompute each tick (no carried Online state), so it auto-recovers when
+// BMQ pressure eases and never ratchets. It never emits a group with Egress==0 or empty IPs (which
+// would poison the whole libbandwidth SetGroupEDT batch): NICs whose IP cannot be resolved are
+// skipped, and a tier group is only emitted when it has members; both rates are clamped >= floor.
+//
+// TODO(nic): this loops per-NIC and treats EgressState.Capacity as that NIC's NIC_total. On the
+// two-NIC E5T (BMQ on its own NIC) the budget may need to be shared across the 100G aggregate rather
+// than computed per-NIC — confirm against the deployment before enabling broadly.
+func (p *StaticPolicy) generateGroups() (map[string]*qrmgeneral.NetworkGroup, error) {
+	groups := make(map[string]*qrmgeneral.NetworkGroup)
+	machineState := p.state.GetMachineState()
+	nics := getAllNICs(p.nicManager)
+
+	conf := p.qrmConfig
+
+	for nicName, nicState := range machineState {
+		if nicState == nil {
+			continue
+		}
+
+		// resolve NIC IP up front; SKIP NICs with no IP (a group with empty IP is InvalidRequest
+		// and would poison the WHOLE EDT batch).
+		selectedNIC := p.getNICByName(nics, nicName)
+		ipv4 := strings.Join(selectedNIC.Addr.GetNICIPs(machine.IPVersionV4), IPsSeparator)
+		ipv6 := strings.Join(selectedNIC.Addr.GetNICIPs(machine.IPVersionV6), IPsSeparator)
+		if ipv4 == "" && ipv6 == "" {
+			general.Warningf("skip NIC %s with no resolvable IP for EDT group reconcile", nicName)
+			continue
+		}
+
+		// bucket containers by tier
+		var beClassIDs, onlineClassIDs []string
+		var bmqContainers []podContainer
+		for podUID, containerEntries := range nicState.PodEntries {
+			for containerName, ai := range containerEntries {
+				if ai == nil {
+					continue
+				}
+				switch tierOf(ai, conf.BMQSelector) {
+				case TierBMQ:
+					bmqContainers = append(bmqContainers, podContainer{podUID: podUID, containerName: containerName})
+				case TierBE:
+					if ai.NetClassID != "" {
+						beClassIDs = append(beClassIDs, ai.NetClassID)
+					}
+				case TierOnline:
+					if ai.NetClassID != "" {
+						onlineClassIDs = append(onlineClassIDs, ai.NetClassID)
+					}
+				}
+			}
+		}
+
+		// observability: surface BMQ match count so a selector misconfig is visible, not silent.
+		_ = p.emitter.StoreInt64("network_edt_bmq_pod_count", int64(len(bmqContainers)), metrics.MetricTypeNameRaw,
+			metrics.MetricTag{Key: "nic", Val: nicName})
+		general.Infof("EDT reconcile NIC %s: bmqContainers=%d beClassIDs=%d onlineClassIDs=%d",
+			nicName, len(bmqContainers), len(beClassIDs), len(onlineClassIDs))
+
+		// NIC_total = raw Capacity (the meeting's "100G" implies raw Capacity, not Allocatable).
+		cap := nicState.EgressState.Capacity
+
+		// runtime BMQ throughput (Option A: direct read of the pre-computed per-container BPS).
+		bmqRuntime := p.sumBMQRuntimeEgress(bmqContainers)
+		bmqReserve := general.MaxUInt32(bmqRuntime, uint32(len(bmqContainers))*conf.BMQReservedPerPod)
+		budget := subClampZero(cap, bmqReserve)
+
+		// tiered allocation: BE squeezed FIRST; both ALWAYS >= floor (never 0); stateless.
+		var beRate, onlineRate uint32
+		if subClampZero(budget, conf.OnlineGroupCeil) >= conf.BEGroupFloor {
+			onlineRate = conf.OnlineGroupCeil                   // no pressure: Online at ceiling
+			beRate = subClampZero(budget, conf.OnlineGroupCeil) // BE absorbs the surplus
+		} else {
+			beRate = conf.BEGroupFloor // BE squeezed to floor first
+			onlineRate = clampLow(subClampZero(budget, conf.BEGroupFloor), conf.OnlineGroupFloor)
+			if onlineRate > conf.OnlineGroupCeil {
+				onlineRate = conf.OnlineGroupCeil
+			}
+		}
+
+		// Emit a tier group ONLY if it has members; rates are >= floor by construction.
+		if len(beClassIDs) > 0 {
+			groups[getGroupName(nicName, LowPriorityGroupNameSuffix)] = &qrmgeneral.NetworkGroup{
+				NetClassIDs: beClassIDs,
+				Egress:      beRate,
+				MergedIPv4:  ipv4,
+				MergedIPv6:  ipv6,
+			}
+		}
+		if len(onlineClassIDs) > 0 {
+			groups[getGroupName(nicName, OnlineGroupNameSuffix)] = &qrmgeneral.NetworkGroup{
+				NetClassIDs: onlineClassIDs,
+				Egress:      onlineRate,
+				MergedIPv4:  ipv4,
+				MergedIPv6:  ipv6,
+			}
+		}
+	}
+
+	return groups, nil
+}
+
+// reconcileGroups recomputes the BE+Online EDT groups and applies them idempotently (skips the
+// data-plane write when nothing changed, to avoid rewriting rule.json every tick). Callers under
+// the feature gate hold p's lock (event path) or the handler acquires it.
+func (p *StaticPolicy) reconcileGroups() error {
+	groups, err := p.generateGroups()
+	if err != nil {
+		return fmt.Errorf("generateGroups failed with error: %v", err)
+	}
+
+	// idempotency: skip the data-plane write when nothing changed.
+	if groupsEqual(groups, p.networkGroups) {
+		return nil
+	}
+
+	general.Infof("old networkGroups: %+v, new networkGroups: %+v", p.networkGroups, groups)
+	if err := p.applyNetworkGroupsFunc(groups); err != nil {
+		return fmt.Errorf("applyNetworkGroups failed with error: %v", err)
+	}
+	p.networkGroups = groups
 	return nil
 }
 
